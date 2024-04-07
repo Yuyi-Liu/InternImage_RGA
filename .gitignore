@@ -6,3 +6,10 @@ classification/convertor/
 segmentation/convertor/
 checkpoint_dir/
 demo/
+*.so
+*.txt
+*.egg
+*.o
+PKG-INFO
+*.ninja*
+segmentation/work_dirs/*

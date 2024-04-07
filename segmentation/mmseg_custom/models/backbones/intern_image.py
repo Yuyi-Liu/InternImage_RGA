@@ -15,7 +15,7 @@ from mmseg.utils import get_root_logger
 from mmseg.models.builder import BACKBONES
 import torch.nn.functional as F
 
-from ops_dcnv3 import modules as dcnv3
+from ops_dcnv3 import modules as opsm
 
 
 class to_channels_first(nn.Module):
@@ -350,7 +350,7 @@ class InternImageLayer(nn.Module):
         with_cp (bool): whether to use checkpoint
     """
 
-    def __init__(self,
+    def __init__(self,idx,
                  core_op,
                  channels,
                  groups,
@@ -365,9 +365,9 @@ class InternImageLayer(nn.Module):
                  with_cp=False,
                  dw_kernel_size=None, # for InternImage-H/G
                  res_post_norm=False, # for InternImage-H/G
-                 center_feature_scale=False,
-                 use_dcn_v4_op=False): # for InternImage-H/G
+                 center_feature_scale=False): # for InternImage-H/G
         super().__init__()
+        self.idx = idx
         self.channels = channels
         self.groups = groups
         self.mlp_ratio = mlp_ratio
@@ -375,19 +375,45 @@ class InternImageLayer(nn.Module):
 
         self.norm1 = build_norm_layer(channels, 'LN')
         self.post_norm = post_norm
-        self.dcn = core_op(
-            channels=channels,
-            kernel_size=3,
-            stride=1,
-            pad=1,
-            dilation=1,
-            group=groups,
-            offset_scale=offset_scale,
-            act_layer=act_layer,
-            norm_layer=norm_layer,
-            dw_kernel_size=dw_kernel_size, # for InternImage-H/G
-            center_feature_scale=center_feature_scale,
-            use_dcn_v4_op=use_dcn_v4_op) # for InternImage-H/G
+        if self.idx not in [0,1,2]:
+            self.dcn = core_op(
+                channels=channels,
+                kernel_size=3,
+                stride=1,
+                pad=1,
+                dilation=1,
+                group=groups,
+                offset_scale=offset_scale,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+                dw_kernel_size=dw_kernel_size, # for InternImage-H/G
+                center_feature_scale=center_feature_scale) # for InternImage-H/G
+        else:
+            self.dcn = opsm.dcnv3.DCNv3_RGA(
+                channels=channels,
+                kernel_size=3,
+                stride=1,
+                pad=1,
+                dilation=1,
+                group=groups,
+                offset_scale=offset_scale,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+                dw_kernel_size=dw_kernel_size, # for InternImage-H/G
+                center_feature_scale=center_feature_scale) # for InternImage-H/G
+    
+        # self.dcn = core_op(
+        #     channels=channels,
+        #     kernel_size=3,
+        #     stride=1,
+        #     pad=1,
+        #     dilation=1,
+        #     group=groups,
+        #     offset_scale=offset_scale,
+        #     act_layer=act_layer,
+        #     norm_layer=norm_layer,
+        #     dw_kernel_size=dw_kernel_size, # for InternImage-H/G
+        #     center_feature_scale=center_feature_scale) # for InternImage-H/G
         self.drop_path = DropPath(drop_path) if drop_path > 0. \
             else nn.Identity()
         self.norm2 = build_norm_layer(channels, 'LN')
@@ -406,32 +432,32 @@ class InternImageLayer(nn.Module):
             self.res_post_norm1 = build_norm_layer(channels, 'LN')
             self.res_post_norm2 = build_norm_layer(channels, 'LN')
 
-    def forward(self, x):
+    def forward(self, x,depth):
 
-        def _inner_forward(x):
+        def _inner_forward(x,depth):
             if not self.layer_scale:
                 if self.post_norm:
-                    x = x + self.drop_path(self.norm1(self.dcn(x)))
+                    x = x + self.drop_path(self.norm1(self.dcn(x,depth)))
                     x = x + self.drop_path(self.norm2(self.mlp(x)))
                 elif self.res_post_norm: # for InternImage-H/G
-                    x = x + self.drop_path(self.res_post_norm1(self.dcn(self.norm1(x))))
+                    x = x + self.drop_path(self.res_post_norm1(self.dcn(self.norm1(x),depth)))
                     x = x + self.drop_path(self.res_post_norm2(self.mlp(self.norm2(x))))
                 else:
-                    x = x + self.drop_path(self.dcn(self.norm1(x)))
+                    x = x + self.drop_path(self.dcn(self.norm1(x),depth))
                     x = x + self.drop_path(self.mlp(self.norm2(x)))
                 return x
             if self.post_norm:
-                x = x + self.drop_path(self.gamma1 * self.norm1(self.dcn(x)))
+                x = x + self.drop_path(self.gamma1 * self.norm1(self.dcn(x,depth)))
                 x = x + self.drop_path(self.gamma2 * self.norm2(self.mlp(x)))
             else:
-                x = x + self.drop_path(self.gamma1 * self.dcn(self.norm1(x)))
+                x = x + self.drop_path(self.gamma1 * self.dcn(self.norm1(x),depth))
                 x = x + self.drop_path(self.gamma2 * self.mlp(self.norm2(x)))
             return x
 
         if self.with_cp and x.requires_grad:
-            x = checkpoint.checkpoint(_inner_forward, x)
+            x = checkpoint.checkpoint(_inner_forward, x,depth)
         else:
-            x = _inner_forward(x)
+            x = _inner_forward(x,depth)
         return x
 
 
@@ -453,7 +479,7 @@ class InternImageBlock(nn.Module):
         with_cp (bool): whether to use checkpoint
     """
 
-    def __init__(self,
+    def __init__(self,idx,
                  core_op,
                  channels,
                  depth,
@@ -471,9 +497,9 @@ class InternImageBlock(nn.Module):
                  dw_kernel_size=None, # for InternImage-H/G
                  post_norm_block_ids=None, # for InternImage-H/G
                  res_post_norm=False, # for InternImage-H/G
-                 center_feature_scale=False, # for InternImage-H/G
-                 use_dcn_v4_op=False):
+                 center_feature_scale=False): # for InternImage-H/G
         super().__init__()
+        self.idx = idx
         self.channels = channels
         self.depth = depth
         self.post_norm = post_norm
@@ -481,6 +507,7 @@ class InternImageBlock(nn.Module):
 
         self.blocks = nn.ModuleList([
             InternImageLayer(
+                idx = self.idx * 100 + i,
                 core_op=core_op,
                 channels=channels,
                 groups=groups,
@@ -496,8 +523,7 @@ class InternImageBlock(nn.Module):
                 with_cp=with_cp,
                 dw_kernel_size=dw_kernel_size, # for InternImage-H/G
                 res_post_norm=res_post_norm, # for InternImage-H/G
-                center_feature_scale=center_feature_scale, # for InternImage-H/G
-                use_dcn_v4_op=use_dcn_v4_op
+                center_feature_scale=center_feature_scale # for InternImage-H/G
             ) for i in range(depth)
         ])
         if not self.post_norm or center_feature_scale:
@@ -510,9 +536,9 @@ class InternImageBlock(nn.Module):
         self.downsample = DownsampleLayer(
             channels=channels, norm_layer=norm_layer) if downsample else None
 
-    def forward(self, x, return_wo_downsample=False):
+    def forward(self, x,depth, return_wo_downsample=False):
         for i, blk in enumerate(self.blocks):
-            x = blk(x)
+            x = blk(x,depth)
             if (self.post_norm_block_ids is not None) and (i in self.post_norm_block_ids):
                 index = self.post_norm_block_ids.index(i)
                 x = self.post_norms[index](x) # for InternImage-H/G
@@ -573,7 +599,6 @@ class InternImage(nn.Module):
                  level2_post_norm_block_ids=None,  # for InternImage-H/G
                  res_post_norm=False,  # for InternImage-H/G
                  center_feature_scale=False,  # for InternImage-H/G
-                 use_dcn_v4_op=False,
                  out_indices=(0, 1, 2, 3),
                  init_cfg=None,
                  **kwargs):
@@ -596,7 +621,6 @@ class InternImage(nn.Module):
         logger.info(f"level2_post_norm: {level2_post_norm}")
         logger.info(f"level2_post_norm_block_ids: {level2_post_norm_block_ids}")
         logger.info(f"res_post_norm: {res_post_norm}")
-        logger.info(f"use_dcn_v4_op: {use_dcn_v4_op}")
 
         in_chans = 3
         self.patch_embed = StemLayer(in_chans=in_chans,
@@ -617,7 +641,8 @@ class InternImage(nn.Module):
             post_norm_block_ids = level2_post_norm_block_ids if level2_post_norm and (
                 i == 2) else None # for InternImage-H/G
             level = InternImageBlock(
-                core_op=getattr(dcnv3, core_op),
+                idx = i,
+                core_op=getattr(opsm, core_op),
                 channels=int(channels * 2**i),
                 depth=depths[i],
                 groups=groups[i],
@@ -634,8 +659,7 @@ class InternImage(nn.Module):
                 dw_kernel_size=dw_kernel_size,  # for InternImage-H/G
                 post_norm_block_ids=post_norm_block_ids, # for InternImage-H/G
                 res_post_norm=res_post_norm, # for InternImage-H/G
-                center_feature_scale=center_feature_scale, # for InternImage-H/G
-                use_dcn_v4_op=use_dcn_v4_op,
+                center_feature_scale=center_feature_scale # for InternImage-H/G
             )
             self.levels.append(level)
 
@@ -694,16 +718,23 @@ class InternImage(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def _init_deform_weights(self, m):
-        if isinstance(m, getattr(dcnv3, self.core_op)):
+        if isinstance(m, getattr(opsm, self.core_op)):
             m._reset_parameters()
 
     def forward(self, x):
+        x = x[:,:-1, :, :]
+        depth = x[:,-1:, :, :]
         x = self.patch_embed(x)
         x = self.pos_drop(x)
+        h, w = x.shape[-3:-1]
+        depth = torch.nn.functional.interpolate(depth, size=(h, w), mode='nearest')
 
         seq_out = []
         for level_idx, level in enumerate(self.levels):
-            x, x_ = level(x, return_wo_downsample=True)
+            x, x_ = level(x,depth, return_wo_downsample=True)
+            h, w = x.shape[-3:-1]
+            depth = torch.nn.functional.interpolate(depth, size=(h, w), mode='nearest')
             if level_idx in self.out_indices:
                 seq_out.append(x_.permute(0, 3, 1, 2).contiguous())
+        
         return seq_out

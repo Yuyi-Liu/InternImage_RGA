@@ -215,136 +215,238 @@ class DCNv3_pytorch(nn.Module):
         return x
 
 
-class DCNv3(nn.Module):
-    def __init__(
-            self,
-            channels=64,
-            kernel_size=3,
-            dw_kernel_size=None,
-            stride=1,
-            pad=1,
-            dilation=1,
-            group=4,
-            offset_scale=1.0,
-            act_layer='GELU',
-            norm_layer='LN',
-            center_feature_scale=False):
-        """
-        DCNv3 Module
-        :param channels
-        :param kernel_size
-        :param stride
-        :param pad
-        :param dilation
-        :param group
-        :param offset_scale
-        :param act_layer
-        :param norm_layer
-        """
-        super().__init__()
-        if channels % group != 0:
-            raise ValueError(
-                f'channels must be divisible by group, but got {channels} and {group}')
-        _d_per_group = channels // group
-        dw_kernel_size = dw_kernel_size if dw_kernel_size is not None else kernel_size
-        # you'd better set _d_per_group to a power of 2 which is more efficient in our CUDA implementation
-        if not _is_power_of_2(_d_per_group):
-            warnings.warn(
-                "You'd better set channels in DCNv3 to make the dimension of each attention head a power of 2 "
-                "which is more efficient in our CUDA implementation.")
 
-        self.offset_scale = offset_scale
-        self.channels = channels
+# kernel:
+class DCNv3_failed(nn.Module):
+
+    # def __init__(self,
+    #              in_channels,
+    #              out_channels,
+    #              kernel_size,
+    #              stride=1,
+    #              padding=1,
+    #              dilation=1,
+    #              bias=False):
+    def __init__(self,
+                 channels=64,
+                 kernel_size=3,
+                 dw_kernel_size=None,
+                 stride=1,
+                 pad=1,
+                 dilation=1,
+                 group=4,
+                 offset_scale=1.0,
+                 act_layer='GELU',
+                 norm_layer='LN',
+                 center_feature_scale=False,
+                 bias=False):
+        super(DCNv3, self).__init__()
+        
+        assert isinstance(kernel_size, int)
+        assert dilation <= 2
+        self.in_channels = channels
+        self.out_channels = channels
         self.kernel_size = kernel_size
-        self.dw_kernel_size = dw_kernel_size
         self.stride = stride
+        self.padding = pad
         self.dilation = dilation
-        self.pad = pad
-        self.group = group
-        self.group_channels = channels // group
-        self.offset_scale = offset_scale
-        self.center_feature_scale = center_feature_scale
-        
-        self.dw_conv = nn.Sequential(
-            nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=dw_kernel_size,
-                stride=1,
-                padding=(dw_kernel_size - 1) // 2,
-                groups=channels),
-            build_norm_layer(
-                channels,
-                norm_layer,
-                'channels_first',
-                'channels_last'),
-            build_act_layer(act_layer))
-        self.offset = nn.Linear(
-            channels,
-            group * kernel_size * kernel_size * 2)
-        self.mask = nn.Linear(
-            channels,
-            group * kernel_size * kernel_size)
-        self.input_proj = nn.Linear(channels, channels)
-        self.output_proj = nn.Linear(channels, channels)
-        self._reset_parameters()
-        
-        if center_feature_scale:
-            self.center_feature_scale_proj_weight = nn.Parameter(
-                torch.zeros((group, channels), dtype=torch.float))
-            self.center_feature_scale_proj_bias = nn.Parameter(
-                torch.tensor(0.0, dtype=torch.float).view((1,)).repeat(group, ))
-            self.center_feature_scale_module = CenterFeatureScaleModule()
+
+        self.alpha = 4.0
+
+        K = self.kernel_size
+        self.weight_offset = nn.Parameter(torch.Tensor(K * K * 2, channels + 1, K, K))
+        self.bias_offset = nn.Parameter(torch.Tensor(K * K * 2))
+
+        self.weight = nn.Parameter(torch.Tensor(channels, channels, kernel_size, kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(pad))
+        else:
+            self.register_parameter('bias', None)
+        self.init_weight()
+
+    def init_weight(self):
+        nn.init.constant_(self.weight_offset, 0.)
+        if self.bias_offset is not None:
+            nn.init.constant_(self.bias_offset, 0.)
 
     def _reset_parameters(self):
-        constant_(self.offset.weight.data, 0.)
-        constant_(self.offset.bias.data, 0.)
-        constant_(self.mask.weight.data, 0.)
-        constant_(self.mask.bias.data, 0.)
-        xavier_uniform_(self.input_proj.weight.data)
-        constant_(self.input_proj.bias.data, 0.)
-        xavier_uniform_(self.output_proj.weight.data)
-        constant_(self.output_proj.bias.data, 0.)
+        self.init_weight()
 
-    # def forward(self, image_and_depth):
-    def forward(self,input,depth=None):
-        """
-        :param query                       (N, H, W, C)
-        :return output                     (N, H, W, C)
-        """
-        # input, depth = image_and_depth
-        N, H, W, _ = input.shape
+    def init_delta(self, B, out_H, out_W, dtype, device):
+        K = self.kernel_size
+        h_st = -((K - 1) // 2) * self.dilation
+        h_ed = (K // 2) * self.dilation + 1
+        w_st = -((K - 1) // 2) * self.dilation
+        w_ed = (K // 2) * self.dilation + 1
 
-        x = self.input_proj(input)
-        x_proj = x
+        delta_x, delta_y = torch.meshgrid(
+            torch.arange(h_st, h_ed, self.dilation),
+            torch.arange(w_st, w_ed, self.dilation)
+        )
+        delta_x = delta_x.contiguous().view(1, K * K, 1, 1)
+        delta_y = delta_y.contiguous().view(1, K * K, 1, 1)
+        delta = torch.cat((delta_x, delta_y), dim=1).repeat(B, 1, out_H, out_W).type(dtype)
+        return delta.to(device)
+    
+    def init_base(self, B, out_h, out_w, x_h, x_w, dtype, device):
+        K = self.kernel_size
+        h_st = ((K - 1) // 2) * self.dilation
+        h_ed = x_h - (K // 2) * self.dilation
+        w_st = ((K - 1) // 2) * self.dilation
+        w_ed = x_w - (K // 2) * self.dilation
+
+        base_x, base_y = torch.meshgrid(
+            torch.arange(h_st, h_ed, self.stride),
+            torch.arange(w_st, w_ed, self.stride)
+        )
+        base_x = base_x.contiguous().view(1, 1, out_h, out_w).repeat(B, K * K, 1, 1)
+        base_y = base_y.contiguous().view(1, 1, out_h, out_w).repeat(B, K * K, 1, 1)
+        base = torch.cat((base_x, base_y), dim=1).type(dtype)
+        return base.to(device)
+    
+    def unfold(self, x: torch.Tensor, base: torch.Tensor, delta: torch.Tensor):
+        K = self.kernel_size
+        B, C, H, W = x.shape
+        out_H = (H + 2 * self.padding - self.dilation * (self.kernel_size - 1) - 1) // self.stride + 1
+        out_W = (W + 2 * self.padding - self.dilation * (self.kernel_size - 1) - 1) // self.stride + 1
+
+        H += 2 * self.dilation
+        W += 2 * self.dilation
+        x = F.pad(x, [self.dilation] * 4, mode='constant', value=0.)
+
+        coordinate = base + delta  # [B, K * K * 2, out_H, out_W]
+
+        coordinate = coordinate.contiguous().view(B, K * K * 2, -1)  # [B, K * K * 2, out_H * out_W]
+
+        c_x = coordinate[:, :K * K, :].contiguous().view(B, -1)   # [B, K * K * out_H * out_W]
+        c_y = coordinate[:, K * K:, :].contiguous().view(B, -1)
+
+        c_x = torch.clamp(c_x, 0, H - 1)
+        c_y = torch.clamp(c_y, 0, W - 1)
+
+        tl_x = c_x.detach().floor().long()
+        tl_y = c_y.detach().floor().long()
+        br_x = tl_x + 1
+        br_y = tl_y + 1
+
+        tl_x = torch.clamp(tl_x, 0, H - 2)
+        tl_y = torch.clamp(tl_y, 0, W - 2)
+        br_x = torch.clamp(br_x, 1, H - 1)
+        br_y = torch.clamp(br_y, 1, W - 1)
+
+        index_tl = (tl_x * W + tl_y)  # [B, K * K * out_H * out_W]
+        index_tr = (tl_x * W + br_y)
+        index_bl = (br_x * W + tl_y)
+        index_br = (br_x * W + br_y)
+        index_tl = index_tl.unsqueeze(dim=1).repeat(1, C, 1)  # [B, C, K * K * out_H * out_W]
+        index_tr = index_tr.unsqueeze(dim=1).repeat(1, C, 1)
+        index_bl = index_bl.unsqueeze(dim=1).repeat(1, C, 1)
+        index_br = index_br.unsqueeze(dim=1).repeat(1, C, 1)
+
+        x = x.contiguous().view(B, C, -1)  #  [B, C, H * W]
+
+        x_tl = x.gather(dim=-1, index=index_tl)   # [B, C, K * K * out_H * out_W]
+        x_tr = x.gather(dim=-1, index=index_tr)
+        x_bl = x.gather(dim=-1, index=index_bl)
+        x_br = x.gather(dim=-1, index=index_br)
+
+        #  [B, K * K * out_H * out_W]
+        c_tl = (1 - (c_x - tl_x.type_as(c_x))) * \
+               (1 - (c_y - tl_y.type_as(c_y)))
+        c_tr = (1 - (c_x - tl_x.type_as(c_x))) * \
+               (1 + (c_y - br_y.type_as(c_y)))
+        c_bl = (1 + (c_x - br_x.type_as(c_x))) * \
+               (1 - (c_y - tl_y.type_as(c_y)))
+        c_br = (1 + (c_x - br_x.type_as(c_x))) * \
+               (1 + (c_y - br_y.type_as(c_y)))
+    
+        #  [B, C, K * K * out_H * out_W]
+        out = x_tl * c_tl.unsqueeze(dim=1) + \
+                x_tr * c_tr.unsqueeze(dim=1) + \
+                x_bl * c_bl.unsqueeze(dim=1) + \
+                x_br * c_br.unsqueeze(dim=1)
+        out = out.contiguous().view(B, -1, out_H * out_W)  # [B, C * K * K, out_H * out_W]
+        return out
+
+    def forward(self, x):
+
+        x, depth = x
+        x = x.permute(0, 3, 1, 2) # (N, C, H, W)
+
+        B, C, H, W = x.shape
+        out_H = (H + 2 * self.padding - self.dilation * (self.kernel_size - 1) - 1) // self.stride + 1
+        out_W = (W + 2 * self.padding - self.dilation * (self.kernel_size - 1) - 1) // self.stride + 1
+        K = self.kernel_size
         dtype = x.dtype
+        device = x.device
 
-        x1 = input.permute(0, 3, 1, 2)
-        x1 = self.dw_conv(x1)
-        offset = self.offset(x1)
-        mask = self.mask(x1).reshape(N, H, W, self.group, -1)
-        mask = F.softmax(mask, -1).reshape(N, H, W, -1).type(dtype)
+        base = self.init_base(B, out_H, out_W, H + 2 * self.dilation, W + 2 * self.dilation, dtype, device)
+        delta = self.init_delta(B, out_H, out_W, dtype, device)
 
-        x = DCNv3Function.apply(
-            x, offset, mask,
-            self.kernel_size, self.kernel_size,
-            self.stride, self.stride,
-            self.pad, self.pad,
-            self.dilation, self.dilation,
-            self.group, self.group_channels,
-            self.offset_scale,
-            256)
+        x_depth = torch.cat([x, depth], dim=1)
+        x_depth_col = F.unfold(x_depth, self.kernel_size, dilation=self.dilation, padding=self.padding, stride=self.stride)
+
+        offset = torch.matmul(self.weight_offset.view(-1, (C + 1) * K * K), x_depth_col)
+        offset = offset.view(B, -1, out_H, out_W)
+        offset += self.bias_offset.view(1, -1, 1, 1)
+
+        delta = delta + offset
+
+        depth_center = depth[:, :, ::self.stride, ::self.stride].contiguous().view(B, 1, out_H * out_W)
+
+        delta_0 = delta * 0.75
+        delta_1 = delta * 1.00
+        delta_2 = delta * 1.25
+
+        depth_col_0 = self.unfold(depth, base, delta_0)
+        depth_col_1 = self.unfold(depth, base, delta_1)
+        depth_col_2 = self.unfold(depth, base, delta_2)
+
+        depth_col_0 = torch.abs(depth_col_0 - depth_center)
+        depth_col_1 = torch.abs(depth_col_1 - depth_center)
+        depth_col_2 = torch.abs(depth_col_2 - depth_center)
+
+        depth_mask = torch.argmin(torch.cat([
+            depth_col_0.unsqueeze(dim=-1),
+            depth_col_1.unsqueeze(dim=-1),
+            depth_col_2.unsqueeze(dim=-1),
+        ], dim=-1), dim=-1)
+
+        mask_0 = torch.zeros_like(depth_mask, requires_grad=False, device=device)
+        mask_1 = torch.zeros_like(depth_mask, requires_grad=False, device=device)
+        mask_2 = torch.zeros_like(depth_mask, requires_grad=False, device=device)
+
+        mask_0[depth_mask == 0] = 1.0
+        mask_1[depth_mask == 1] = 1.0
+        mask_2[depth_mask == 2] = 1.0
+
+        mask_0 = mask_0.repeat(1, C, 1)
+        mask_1 = mask_1.repeat(1, C, 1)
+        mask_2 = mask_2.repeat(1, C, 1)
+
+        x_col_0 = self.unfold(x, base, delta_0)
+        x_col_1 = self.unfold(x, base, delta_1)
+        x_col_2 = self.unfold(x, base, delta_2)
+
+        mouduls_0 = torch.exp(-self.alpha * depth_col_0).repeat(1, C, 1)
+        mouduls_1 = torch.exp(-self.alpha * depth_col_1).repeat(1, C, 1)
+        mouduls_2 = torch.exp(-self.alpha * depth_col_2).repeat(1, C, 1)
+
+        x_col_0 *= mouduls_0
+        x_col_1 *= mouduls_1
+        x_col_2 *= mouduls_2
+
+        x_col = mask_0 * x_col_0 + mask_1 * x_col_1 + mask_2 * x_col_2
+
+        out = torch.matmul(self.weight.view(-1, C * K * K), x_col)
+        out = out.view(B, -1, out_H, out_W)
+        if self.bias:
+            out += self.bias.view(1, -1, 1, 1)
+        print(out.shape)  # torch.Size([1, 192, 160, 160])
         
-        if self.center_feature_scale:
-            center_feature_scale = self.center_feature_scale_module(
-                x1, self.center_feature_scale_proj_weight, self.center_feature_scale_proj_bias)
-            # N, H, W, groups -> N, H, W, groups, 1 -> N, H, W, groups, _d_per_group -> N, H, W, channels
-            center_feature_scale = center_feature_scale[..., None].repeat(
-                1, 1, 1, 1, self.channels // self.group).flatten(-2)
-            x = x * (1 - center_feature_scale) + x_proj * center_feature_scale
-        x = self.output_proj(x)
+        out = out.permute(0, 2, 3, 1)
+        return (out, depth)
 
-        return x
 
 class DeformConv2d(nn.Module):
     def __init__(self, inc, outc, kernel_size=3, stride=1, padding=1, bias=None, modulation=True):
@@ -356,8 +458,7 @@ class DeformConv2d(nn.Module):
         self.kernel_size = kernel_size
         self.padding = padding
         self.stride = stride
-        if self.padding:
-            self.zero_padding = nn.ZeroPad2d(padding)
+        self.zero_padding = nn.ZeroPad2d(padding)
         self.conv = nn.Conv2d(inc, outc, kernel_size=kernel_size, stride=kernel_size, bias=bias)
 
         self.p_conv = nn.Conv2d(inc, 2*kernel_size*kernel_size, kernel_size=3, padding=1, stride=stride)
@@ -365,10 +466,10 @@ class DeformConv2d(nn.Module):
         self.p_conv.register_backward_hook(self._set_lr)
 
         self.modulation = modulation
-        # if modulation:
-        #     self.m_conv = nn.Conv2d(inc, kernel_size*kernel_size, kernel_size=3, padding=1, stride=stride)
-        #     nn.init.constant_(self.m_conv.weight, 0)
-        #     self.m_conv.register_backward_hook(self._set_lr)
+        if modulation:
+            self.m_conv = nn.Conv2d(inc, kernel_size*kernel_size, kernel_size=3, padding=1, stride=stride)
+            nn.init.constant_(self.m_conv.weight, 0)
+            self.m_conv.register_backward_hook(self._set_lr)
 
     @staticmethod
     def _set_lr(module, grad_input, grad_output):
@@ -673,6 +774,75 @@ class DeformConv2d(nn.Module):
 
         return x_offset
 
+# class DeformableConv2D(nn.Module):
+#     def __init__(self, input_channels, output_channels, kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, group, group_channels, offset_scale, im2col_step):
+#         super(DeformableConv2D, self).__init__()
+#         self.kernel_h = kernel_h
+#         self.kernel_w = kernel_w
+#         self.stride_h = stride_h
+#         self.stride_w = stride_w
+#         self.pad_h = pad_h
+#         self.pad_w = pad_w
+#         self.dilation_h = dilation_h
+#         self.dilation_w = dilation_w
+#         self.group = group
+#         self.group_channels = group_channels
+#         self.offset_scale = offset_scale
+#         self.im2col_step = im2col_step
+
+#         self.conv_offset = nn.Conv2d(input_channels, 2 * kernel_h * kernel_w * group_channels, kernel_size=1, stride=1, padding=0, bias=True)
+#         self.conv_mask = nn.Conv2d(input_channels, kernel_h * kernel_w * group_channels, kernel_size=1, stride=1, padding=0, bias=True)
+#         self.conv = nn.Conv2d(input_channels, output_channels, kernel_size=(kernel_h, kernel_w), stride=(stride_h, stride_w), padding=(pad_h, pad_w), dilation=(dilation_h, dilation_w), groups=group)
+
+#     def forward(self, x):
+#         offset = self.conv_offset(x)
+#         mask = torch.sigmoid(self.conv_mask(x))
+#         # print(offset.shape, mask.shape) # torch.Size([1, 576, 224, 224]) torch.Size([1, 288, 224, 224])
+#         # print(x.shape) # torch.Size([1, 320, 224, 224])
+#         x = self.deform_conv2d(x, offset, mask, self.conv.weight, None, self.stride_h, self.stride_w, self.pad_h, self.pad_w, self.dilation_h, self.dilation_w, self.group, self.group_channels, self.offset_scale, self.im2col_step)
+#         return x
+    
+#     def deform_conv2d(self, x, offset, mask, weight, bias, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, group, group_channels, offset_scale, im2col_step):
+#         batch_size, input_channels, input_height, input_width = x.size()
+#         output_channels, _, kernel_h, kernel_w = weight.size()
+
+#         # Reshape the offset tensor and apply the offset_scale
+#         offset = offset.view(batch_size, 2 * group_channels, -1, input_height, input_width) * offset_scale
+#         offset = offset.permute(0, 2, 3, 4, 1)
+
+#         # Create the grid for grid_sample
+#         grid_y, grid_x = torch.meshgrid(torch.arange(input_height), torch.arange(input_width))
+#         grid = torch.stack((grid_x, grid_y), 2).float().unsqueeze(0)
+#         grid = grid.repeat(batch_size, 1, 1, 1)
+
+#         # Move the grid tensor to the same device as the offset tensor
+#         grid = grid.to(offset.device)
+
+#         # Apply the offsets to the grid
+#         grid_offset = grid + offset
+#         grid_offset = (grid_offset / torch.tensor([input_width - 1, input_height - 1], device=grid_offset.device)) * 2 - 1
+
+#         # Reshape the mask tensor
+#         mask = mask.view(batch_size, group_channels, -1, input_height, input_width)
+#         mask = mask.permute(0, 2, 3, 4, 1)
+
+#         # Apply the offsets and masks to the input feature map
+#         x_offset = F.grid_sample(x, grid_offset, align_corners=False)
+#         x_mask = F.grid_sample(x, grid_offset, align_corners=False) * mask
+
+#         # Perform the convolution for each group
+#         x_deform = []
+#         for g in range(group):
+#             x_deform_g = F.conv2d(x_offset[:, g * group_channels:(g + 1) * group_channels] * x_mask[:, g * group_channels:(g + 1) * group_channels],
+#                                 weight[g * output_channels // group:(g + 1) * output_channels // group],
+#                                 bias[g * output_channels // group:(g + 1) * output_channels // group],
+#                                 stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w)
+#             x_deform.append(x_deform_g)
+#         x_deform = torch.cat(x_deform, dim=1)
+
+#         return x_deform
+
+
 class DCNv3_RGA(nn.Module):
     def __init__(
             self,
@@ -737,36 +907,37 @@ class DCNv3_RGA(nn.Module):
                 'channels_last'),
             build_act_layer(act_layer))
 
-        # self.input_proj = nn.Linear(channels, channels)
+        self.input_proj = nn.Linear(channels, channels)
         self.output_proj = nn.Linear(channels, channels)
         self._reset_parameters()
         
-        # if center_feature_scale:
-        #     self.center_feature_scale_proj_weight = nn.Parameter(
-        #         torch.zeros((group, channels), dtype=torch.float))
-        #     self.center_feature_scale_proj_bias = nn.Parameter(
-        #         torch.tensor(0.0, dtype=torch.float).view((1,)).repeat(group, ))
-        #     self.center_feature_scale_module = CenterFeatureScaleModule()
+        if center_feature_scale:
+            self.center_feature_scale_proj_weight = nn.Parameter(
+                torch.zeros((group, channels), dtype=torch.float))
+            self.center_feature_scale_proj_bias = nn.Parameter(
+                torch.tensor(0.0, dtype=torch.float).view((1,)).repeat(group, ))
+            self.center_feature_scale_module = CenterFeatureScaleModule()
 
         self.deformable_conv = DeformConv2d(channels, channels, self.kernel_size, self.stride, self.pad)
 
 
     def _reset_parameters(self):
-        # xavier_uniform_(self.input_proj.weight.data)
-        # constant_(self.input_proj.bias.data, 0.)
+        xavier_uniform_(self.input_proj.weight.data)
+        constant_(self.input_proj.bias.data, 0.)
         xavier_uniform_(self.output_proj.weight.data)
         constant_(self.output_proj.bias.data, 0.)
 
-    def forward(self,input,depth):
+    def forward(self, x):
         """
         :param query                       (N, H, W, C)
         :return output                     (N, H, W, C)
         """
 
-        # input, depth = x  # torch.Size([1, 224, 224, 320]) torch.Size([1, 1, 224, 224])
-        
-        # x = self.input_proj(input)
-        
+        input, depth = x  # torch.Size([1, 224, 224, 320]) torch.Size([1, 1, 224, 224])
+        N, H, W, _ = input.shape
+        x = self.input_proj(input)
+        x_proj = x
+        dtype = x.dtype
         x1 = input.permute(0, 3, 1, 2) # (N, C, H, W)
         x1 = self.dw_conv(x1)
         x1 = x1.permute(0, 3, 1, 2) # torch.Size([1, 192, 160, 160])
@@ -776,4 +947,158 @@ class DCNv3_RGA(nn.Module):
         
         x = self.output_proj(x)
 
-        return x
+        return (x, depth)
+
+
+
+
+
+class DCNv3(nn.Module):
+    def __init__(
+            self,
+            channels=64,
+            kernel_size=3,
+            dw_kernel_size=None,
+            stride=1,
+            pad=1,
+            dilation=1,
+            group=4,
+            offset_scale=1.0,
+            act_layer='GELU',
+            norm_layer='LN',
+            center_feature_scale=False):
+        """
+        DCNv3 Module
+        :param channels
+        :param kernel_size
+        :param stride
+        :param pad
+        :param dilation
+        :param group
+        :param offset_scale
+        :param act_layer
+        :param norm_layer
+        """
+        super().__init__()
+        if channels % group != 0:
+            raise ValueError(
+                f'channels must be divisible by group, but got {channels} and {group}')
+        _d_per_group = channels // group
+        dw_kernel_size = dw_kernel_size if dw_kernel_size is not None else kernel_size
+        # you'd better set _d_per_group to a power of 2 which is more efficient in our CUDA implementation
+        if not _is_power_of_2(_d_per_group):
+            warnings.warn(
+                "You'd better set channels in DCNv3 to make the dimension of each attention head a power of 2 "
+                "which is more efficient in our CUDA implementation.")
+
+        self.offset_scale = offset_scale
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.dw_kernel_size = dw_kernel_size
+        self.stride = stride
+        self.dilation = dilation
+        self.pad = pad
+        self.group = group
+        self.group_channels = channels // group
+        self.offset_scale = offset_scale
+        self.center_feature_scale = center_feature_scale
+        
+        self.dw_conv = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=dw_kernel_size,
+                stride=1,
+                padding=(dw_kernel_size - 1) // 2,
+                groups=channels),
+            build_norm_layer(
+                channels,
+                norm_layer,
+                'channels_first',
+                'channels_last'),
+            build_act_layer(act_layer))
+        self.offset = nn.Linear(
+            channels,
+            group * kernel_size * kernel_size * 2)
+        self.mask = nn.Linear(
+            channels,
+            group * kernel_size * kernel_size)
+        self.input_proj = nn.Linear(channels, channels)
+        self.output_proj = nn.Linear(channels, channels)
+        self._reset_parameters()
+        
+        if center_feature_scale:
+            self.center_feature_scale_proj_weight = nn.Parameter(
+                torch.zeros((group, channels), dtype=torch.float))
+            self.center_feature_scale_proj_bias = nn.Parameter(
+                torch.tensor(0.0, dtype=torch.float).view((1,)).repeat(group, ))
+            self.center_feature_scale_module = CenterFeatureScaleModule()
+
+    def _reset_parameters(self):
+        constant_(self.offset.weight.data, 0.)
+        constant_(self.offset.bias.data, 0.)
+        constant_(self.mask.weight.data, 0.)
+        constant_(self.mask.bias.data, 0.)
+        xavier_uniform_(self.input_proj.weight.data)
+        constant_(self.input_proj.bias.data, 0.)
+        xavier_uniform_(self.output_proj.weight.data)
+        constant_(self.output_proj.bias.data, 0.)
+
+    def forward(self, x):
+        """
+        :param query                       (N, H, W, C)
+        :return output                     (N, H, W, C)
+        """
+
+        input, depth = x
+        N, H, W, _ = input.shape
+        # print('0', depth.shape)  # torch.Size([1, 1, 160, 160])
+        # print('1', input.shape)  # torch.Size([1, 160, 160, 192])
+        x = self.input_proj(input)
+        # print('2', x.shape)  # torch.Size([1, 160, 160, 192])
+        x_proj = x
+        dtype = x.dtype
+
+        x1 = input.permute(0, 3, 1, 2) # (N, C, H, W)
+        # print('3', x1.shape) # torch.Size([1, 192, 160, 160])
+        x1 = self.dw_conv(x1)
+        # print('4', x1.shape) # torch.Size([1, 160, 160, 192])
+        offset = self.offset(x1)
+        # print('offset', offset.shape)  # torch.Size([1, 160, 160, 216])
+        mask = self.mask(x1).reshape(N, H, W, self.group, -1)
+        mask = F.softmax(mask, -1).reshape(N, H, W, -1).type(dtype)
+        # print('mask', mask.shape)  # torch.Size([1, 160, 160, 108])
+
+        '''
+        0 torch.Size([1, 1, 160, 160])
+        1 torch.Size([1, 160, 160, 192])
+        2 torch.Size([1, 160, 160, 192])
+        3 torch.Size([1, 192, 160, 160])
+        4 torch.Size([1, 160, 160, 192])
+        offset torch.Size([1, 160, 160, 216])
+        mask torch.Size([1, 160, 160, 108])
+        '''
+
+        x = DCNv3Function.apply(
+            x, offset, mask,
+            self.kernel_size, self.kernel_size,
+            self.stride, self.stride,
+            self.pad, self.pad,
+            self.dilation, self.dilation,
+            self.group, self.group_channels,
+            self.offset_scale,
+            256)
+        # print(x.shape)  # torch.Size([1, 160, 160, 192])
+        
+        if self.center_feature_scale: # defeat: False
+            center_feature_scale = self.center_feature_scale_module(
+                x1, self.center_feature_scale_proj_weight, self.center_feature_scale_proj_bias)
+            # N, H, W, groups -> N, H, W, groups, 1 -> N, H, W, groups, _d_per_group -> N, H, W, channels
+            center_feature_scale = center_feature_scale[..., None].repeat(
+                1, 1, 1, 1, self.channels // self.group).flatten(-2)
+            x = x * (1 - center_feature_scale) + x_proj * center_feature_scale
+                
+        x = self.output_proj(x)
+        # print(x.shape)  # torch.Size([1, 160, 160, 192])
+
+        return (x, depth)
