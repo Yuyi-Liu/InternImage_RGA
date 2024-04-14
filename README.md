@@ -111,54 +111,42 @@ For example, to train `InternImage-T` with 8 GPU on 1 node (total batch size 16)
 sh dist_train.sh configs/ade20k/upernet_internimage_t_512_160k_ade20k.py 8
 ```
 
-### Manage Jobs with Slurm
+### Modify the insertion location of RGA layer
 
-For example, to train `InternImage-XL` with 8 GPU on 1 node (total batch size 16), run:
+Please refer to the following code in the segmentation/mmseg_custom/models/backbones/intern_image.py file to modify the insertion location.
 
-```bash
-GPUS=8 sh slurm_train.sh <partition> <job-name> configs/ade20k/upernet_internimage_xl_640_160k_ade20k.py
-```
-
-### Image Demo
-To inference a single/multiple image like this.
-If you specify image containing directory instead of a single image, it will process all the images in the directory.:
-```
-CUDA_VISIBLE_DEVICES=0 python image_demo.py \
-  data/ade/ADEChallengeData2016/images/validation/ADE_val_00000591.jpg \
-  configs/ade20k/upernet_internimage_t_512_160k_ade20k.py  \
-  checkpoint_dir/seg/upernet_internimage_t_512_160k_ade20k.pth  \
-  --palette ade20k 
-```
-
-### Export
-
-To export a segmentation model from PyTorch to TensorRT, run:
-```shell
-MODEL="model_name"
-CKPT_PATH="/path/to/model/ckpt.pth"
-
-python deploy.py \
-    "./deploy/configs/mmseg/segmentation_tensorrt_static-512x512.py" \
-    "./configs/ade20k/${MODEL}.py" \
-    "${CKPT_PATH}" \
-    "./deploy/demo.png" \
-    --work-dir "./work_dirs/mmseg/${MODEL}" \
-    --device cuda \
-    --dump-info
-```
-
-For example, to export `upernet_internimage_t_512_160k_ade20k` from PyTorch to TensorRT, run:
-```shell
-MODEL="upernet_internimage_t_512_160k_ade20k"
-CKPT_PATH="/path/to/model/ckpt/upernet_internimage_t_512_160k_ade20k.pth"
-
-python deploy.py \
-    "./deploy/configs/mmseg/segmentation_tensorrt_static-512x512.py" \
-    "./configs/ade20k/${MODEL}.py" \
-    "${CKPT_PATH}" \
-    "./deploy/demo.png" \
-    --work-dir "./work_dirs/mmseg/${MODEL}" \
-    --device cuda \
-    --dump-info
+```python3
+class InternImageLayer(nn.Module):
+    def __init__(self,idx,
+                 core_op,
+                 channels,
+                 groups,
+                 mlp_ratio=4.,
+                 drop=0.,
+                 drop_path=0.,
+                 act_layer='GELU',
+                 norm_layer='LN',
+                 post_norm=False,
+                 layer_scale=None,
+                 offset_scale=1.0,
+                 with_cp=False,
+                 dw_kernel_size=None, # for InternImage-H/G
+                 res_post_norm=False, # for InternImage-H/G
+                 center_feature_scale=False): # for InternImage-H/G
+        # ........
+        if self.idx not in [100,101]:
+            self.dcn = core_op(
+                channels=channels,
+                kernel_size=3,
+                stride=1,
+                pad=1,
+                dilation=1,
+                group=groups,
+                offset_scale=offset_scale,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+                dw_kernel_size=dw_kernel_size, # for InternImage-H/G
+                center_feature_scale=center_feature_scale) # for InternImage-H/G
+      # .........
 ```
 
